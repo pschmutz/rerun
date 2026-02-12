@@ -299,10 +299,11 @@ fn try_size_from_video_stream_sample(
     };
 
     match re_video::detect_gop_start(sample, codec).ok()? {
-        re_video::GopStartDetection::StartOfGop(descr) => Some([
+        re_video::GopStartDetection::StartOfGop(Some(descr)) => Some([
             descr.coded_dimensions[0] as _,
             descr.coded_dimensions[1] as _,
         ]),
-        re_video::GopStartDetection::NotStartOfGop => None,
+        re_video::GopStartDetection::StartOfGop(None)
+        | re_video::GopStartDetection::NotStartOfGop => None,
     }
 }

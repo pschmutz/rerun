@@ -125,7 +125,7 @@ pub fn detect_h264_annexb_gop(
     match handler.coding_details_from_sps {
         Some(Ok(decoding_details)) => {
             if handler.idr_frame_found {
-                Ok(GopStartDetection::StartOfGop(decoding_details))
+                Ok(GopStartDetection::StartOfGop(Some(decoding_details)))
             } else {
                 // In theory it could happen that we got an SPS but no IDR frame.
                 // Arguably we should preserve the information from the SPS, but practically it's not useful:
@@ -134,10 +134,29 @@ pub fn detect_h264_annexb_gop(
                 Ok(GopStartDetection::NotStartOfGop)
             }
         }
-        Some(Err(error_str)) => Err(DetectGopStartError::FailedToExtractEncodingDetails(
-            error_str,
-        )),
-        None => Ok(GopStartDetection::NotStartOfGop),
+        Some(Err(error_str)) => {
+            if handler.idr_frame_found {
+                // SPS parsing failed but we still found an IDR frame.
+                // Report it as a keyframe without encoding details.
+                re_log::warn_once!(
+                    "Found H.264 keyframe but failed to parse SPS: {error_str}. \
+                     Playback may still work if encoding details were previously established."
+                );
+                Ok(GopStartDetection::StartOfGop(None))
+            } else {
+                Err(DetectGopStartError::FailedToExtractEncodingDetails(
+                    error_str,
+                ))
+            }
+        }
+        None => {
+            if handler.idr_frame_found {
+                // IDR without SPS - still a keyframe
+                Ok(GopStartDetection::StartOfGop(None))
+            } else {
+                Ok(GopStartDetection::NotStartOfGop)
+            }
+        }
     }
 }
 
@@ -197,7 +216,7 @@ pub fn write_avc_chunk_to_nalu_stream(
 #[cfg(test)]
 mod test {
     use super::{GopStartDetection, detect_h264_annexb_gop};
-    use crate::{ChromaSubsamplingModes, DetectGopStartError, VideoEncodingDetails};
+    use crate::{ChromaSubsamplingModes, VideoEncodingDetails};
 
     #[test]
     fn test_detect_h264_annexb_gop() {
@@ -213,16 +232,17 @@ mod test {
         let result = detect_h264_annexb_gop(sample_data);
         assert_eq!(
             result,
-            Ok(GopStartDetection::StartOfGop(VideoEncodingDetails {
+            Ok(GopStartDetection::StartOfGop(Some(VideoEncodingDetails {
                 codec_string: "avc1.64000A".to_owned(),
                 coded_dimensions: [64, 64],
                 bit_depth: Some(8),
                 chroma_subsampling: Some(ChromaSubsamplingModes::Yuv420),
                 stsd: None,
-            }))
+            })))
         );
 
         // Example H.264 Annex B encoded data containing broken SPS and IDR frame. (above example but messed with the SPS)
+        // With the fix, broken SPS + IDR should still be detected as a keyframe (without encoding details).
         let sample_data = &[
             // SPS NAL unit
             0x00, 0x00, 0x00, 0x01, 0x67, 0x00, 0x00, 0x0A, 0xAC, 0x72, 0x84, 0x44, 0x26, 0x84,
@@ -232,11 +252,10 @@ mod test {
             0x8F, 0x2C, 0x8C, 0x54, 0x4A, 0x92, 0x54, 0x2B, 0x8F, 0x2C, 0x8C, 0x54, 0x4A, 0x92,
         ];
         let result = detect_h264_annexb_gop(sample_data);
+        // Broken SPS + IDR → keyframe detected but without encoding details
         assert_eq!(
             result,
-            Err(DetectGopStartError::FailedToExtractEncodingDetails(
-                "Failed reading SPS: RbspReaderError(RemainingData)".to_owned()
-            ))
+            Ok(GopStartDetection::StartOfGop(None))
         );
 
         // Garbage data, still annex b shaped. (ai generated)

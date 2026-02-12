@@ -39,8 +39,12 @@ impl Eq for DetectGopStartError {}
 /// I.e. whether a sample is the start of a GOP and if so, encoding details we were able to extract from it.
 #[derive(Default, PartialEq, Eq, Debug)]
 pub enum GopStartDetection {
-    /// The sample is the start of a GOP and encoding details have been extracted.
-    StartOfGop(VideoEncodingDetails),
+    /// The sample is the start of a GOP.
+    ///
+    /// Encoding details are `Some` if they could be extracted (e.g., from an SPS NAL unit),
+    /// or `None` if the keyframe was detected but encoding details could not be determined
+    /// (e.g., SPS parsing failed or was not present).
+    StartOfGop(Option<VideoEncodingDetails>),
 
     /// The sample is not the start of a GOP.
     #[default]
@@ -65,7 +69,7 @@ pub fn detect_gop_start(
     #[expect(clippy::match_same_arms)]
     match codec {
         VideoCodec::H264 => detect_h264_annexb_gop(sample_data),
-        VideoCodec::H265 => detect_h265_annexb_gop(sample_data),
+        VideoCodec::H265 => Ok(detect_h265_annexb_gop(sample_data)),
         VideoCodec::AV1 => detect_av1_keyframe_start(sample_data),
         VideoCodec::VP8 => Err(DetectGopStartError::UnsupportedCodec(codec)),
         VideoCodec::VP9 => Err(DetectGopStartError::UnsupportedCodec(codec)),

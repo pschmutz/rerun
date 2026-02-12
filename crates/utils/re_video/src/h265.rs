@@ -7,9 +7,7 @@ use crate::nalu::{
     ANNEXB_NAL_START_CODE, AnnexBStreamState, AnnexBStreamWriteError,
     write_length_prefixed_nalus_to_annexb_stream,
 };
-use crate::{
-    ChromaSubsamplingModes, Chunk, DetectGopStartError, GopStartDetection, VideoEncodingDetails,
-};
+use crate::{ChromaSubsamplingModes, Chunk, GopStartDetection, VideoEncodingDetails};
 
 /// Retrieve [`VideoEncodingDetails`] from an H.265 SPS.
 pub fn encoding_details_from_h265_sps(sps: &Sps) -> VideoEncodingDetails {
@@ -101,49 +99,67 @@ fn hevc_codec_string(profile_tier_level: &ProfileTierLevel) -> String {
     codec
 }
 
-pub fn detect_h265_annexb_gop(data: &[u8]) -> Result<GopStartDetection, DetectGopStartError> {
+pub fn detect_h265_annexb_gop(data: &[u8]) -> GopStartDetection {
     let mut parser = Parser::default();
     let mut details: Option<VideoEncodingDetails> = None;
-    let mut idr_found = false;
+    let mut sps_error: Option<String> = None;
+    let mut irap_found = false;
     let mut cursor = std::io::Cursor::new(data);
 
     while let Ok(nalu) = Nalu::next(&mut cursor) {
         match nalu.header.type_ {
+            NaluType::VpsNut => {
+                // Parse VPS so it's available as context when parsing SPS.
+                // Ignore errors - the SPS can often be parsed without VPS context.
+                drop(parser.parse_vps(&nalu));
+            }
             NaluType::SpsNut if details.is_none() => {
                 if nalu.as_ref().len() < nalu.header.len() {
                     // Prevent panic inside of `parse_sps`.
-                    return Err(DetectGopStartError::FailedToExtractEncodingDetails(
-                        "SPS NALU is incomplete".to_owned(),
-                    ));
+                    sps_error = Some("SPS NALU is incomplete".to_owned());
+                } else {
+                    match parser.parse_sps(&nalu) {
+                        Ok(sps_ref) => {
+                            details = Some(encoding_details_from_h265_sps(sps_ref));
+                        }
+                        Err(err) => {
+                            // Don't fail the entire detection if SPS parsing fails.
+                            // We can still detect the keyframe even without encoding details.
+                            sps_error = Some(err);
+                        }
+                    }
                 }
-
-                // parse_sps returns &Sps, so bind to a reference
-                let sps_ref: &Sps = parser
-                    .parse_sps(&nalu)
-                    .map_err(DetectGopStartError::FailedToExtractEncodingDetails)?;
-
-                // convert into your VideoEncodingDetails
-                details = Some(encoding_details_from_h265_sps(sps_ref));
             }
-            t if t.is_idr() => {
-                idr_found = true;
+            // Use is_irap() to also catch CRA (Clean Random Access) and BLA (Broken Link Access)
+            // frames in addition to IDR frames. All of these are valid random access points.
+            t if t.is_irap() => {
+                irap_found = true;
             }
             _ => {}
         }
-        if idr_found && details.is_some() {
+        if irap_found {
+            // SPS/VPS always come before IRAP frames in a valid stream,
+            // so we won't find additional encoding details after the IRAP.
             break;
         }
     }
 
-    if idr_found {
+    if irap_found {
         if let Some(ved) = details {
-            Ok(GopStartDetection::StartOfGop(ved))
+            GopStartDetection::StartOfGop(Some(ved))
         } else {
-            // saw IDR but no SPS → not useful
-            Ok(GopStartDetection::NotStartOfGop)
+            // We found an IRAP frame but either no SPS or SPS parsing failed.
+            // Still report it as a keyframe - the caller may already have encoding details.
+            if let Some(err) = sps_error {
+                re_log::warn_once!(
+                    "Found H.265 keyframe but failed to parse SPS: {err}. \
+                     Playback may still work if encoding details were previously established."
+                );
+            }
+            GopStartDetection::StartOfGop(None)
         }
     } else {
-        Ok(GopStartDetection::NotStartOfGop)
+        GopStartDetection::NotStartOfGop
     }
 }
 
@@ -202,7 +218,7 @@ pub fn write_hevc_chunk_to_nalu_stream(
 #[cfg(test)]
 mod test {
     use super::{GopStartDetection, detect_h265_annexb_gop};
-    use crate::{ChromaSubsamplingModes, DetectGopStartError, VideoEncodingDetails};
+    use crate::{ChromaSubsamplingModes, VideoEncodingDetails};
 
     #[test]
     fn test_detect_h265_annexb_gop() {
@@ -225,7 +241,7 @@ mod test {
         let result = detect_h265_annexb_gop(sample_data);
         assert_eq!(
             result,
-            Ok(GopStartDetection::StartOfGop(VideoEncodingDetails {
+            GopStartDetection::StartOfGop(Some(VideoEncodingDetails {
                 codec_string: "hvc1.1.6.L120.90".to_owned(),
                 coded_dimensions: [1920, 1080],
                 bit_depth: Some(8),
@@ -235,25 +251,22 @@ mod test {
         );
 
         // Example H.265 Annex B encoded data containing broken SPS and IDR frame. (above example but messed with the SPS)
+        // With the fix, broken SPS + IDR should still be detected as a keyframe (without encoding details).
         let sample_data = &[
             // VPS NAL unit (NAL type 32)
             0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00,
             0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x5D, 0x95, 0x98, 0x09,
-            // Broken SPS NAL unit (NAL type 33)
-            0x00, 0x00, 0x00, 0x01, 0x42, 0x00, 0x00, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90,
-            0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x5D, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x1F,
+            // Broken SPS NAL unit (NAL type 33) — valid header but corrupted payload
+            0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0xFF, 0xFF, 0x60, 0xFF, 0xFF, 0x03, 0xFF, 0x90,
+            0xFF, 0xFF, 0x03, 0xFF, 0xFF, 0x03, 0xFF, 0x5D, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x1F,
             0xE5, 0x8E, 0x49, 0x24, 0x94, 0x92, 0x49, 0x24, 0x92, 0x49, 0x24, 0x94, 0x92, 0x49,
             // IDR frame NAL unit (NAL type 19)
             0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0x88, 0x84, 0x21, 0x43, 0x02, 0x4C, 0x82, 0x54,
             0x2B, 0x8F, 0x2C, 0x8C, 0x54, 0x4A, 0x92, 0x54, 0x2B, 0x8F, 0x2C, 0x8C, 0x54, 0x4A,
         ];
         let result = detect_h265_annexb_gop(sample_data);
-        assert_eq!(
-            result,
-            Err(DetectGopStartError::FailedToExtractEncodingDetails(
-                "SPS NALU is incomplete".to_owned()
-            ))
-        );
+        // Broken SPS + IDR → keyframe detected but without encoding details
+        assert_eq!(result, GopStartDetection::StartOfGop(None));
 
         // Garbage data, still annex b shaped. (ai generated)
         let sample_data = &[
@@ -262,11 +275,11 @@ mod test {
             0x80,
         ];
         let result = detect_h265_annexb_gop(sample_data);
-        assert_eq!(result, Ok(GopStartDetection::NotStartOfGop));
+        assert_eq!(result, GopStartDetection::NotStartOfGop);
 
         // Garbage data, no detectable nalu units.
         let sample_data = &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A];
         let result = detect_h265_annexb_gop(sample_data);
-        assert_eq!(result, Ok(GopStartDetection::NotStartOfGop));
+        assert_eq!(result, GopStartDetection::NotStartOfGop);
     }
 }

@@ -997,7 +997,9 @@ fn is_sample_sync(
 ) -> bool {
     match re_video::detect_gop_start(sample_bytes, *codec) {
         Ok(re_video::GopStartDetection::StartOfGop(new_encoding_details)) => {
-            if encoding_details.as_ref() != Some(&new_encoding_details) {
+            if let Some(new_encoding_details) = new_encoding_details
+                && encoding_details.as_ref() != Some(&new_encoding_details)
+            {
                 if let Some(old_encoding_details) = encoding_details.as_ref() {
                     re_log::warn_once!(
                         "Detected change of video encoding properties (like size, bit depth, compression etc.) over time. \

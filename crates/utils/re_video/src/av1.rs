@@ -70,8 +70,8 @@ pub fn detect_av1_keyframe_start(data: &[u8]) -> Result<GopStartDetection, Detec
         skip_obu(&mut cursor, obu_size).map_err(DetectGopStartError::Av1ParserError)?;
     }
 
-    if keyframe_found && let Some(details) = video_encoding_details {
-        Ok(GopStartDetection::StartOfGop(details))
+    if keyframe_found {
+        Ok(GopStartDetection::StartOfGop(video_encoding_details))
     } else {
         Ok(GopStartDetection::NotStartOfGop)
     }
@@ -155,12 +155,15 @@ mod test {
         let result = detect_av1_keyframe_start(super::AV1_TEST_KEYFRAME);
 
         match result {
-            Ok(GopStartDetection::StartOfGop(details)) => {
+            Ok(GopStartDetection::StartOfGop(Some(details))) => {
                 // Verify we got expected details from the AV1 stream
                 assert_eq!(details.codec_string, "av01");
                 assert_eq!(details.coded_dimensions, [64, 64]);
 
                 assert_eq!(details.bit_depth, Some(8));
+            }
+            Ok(GopStartDetection::StartOfGop(None)) => {
+                panic!("Expected encoding details but got StartOfGop(None)")
             }
             Err(err) => panic!("Failed to parse valid AV1 data: {err}"),
             Ok(GopStartDetection::NotStartOfGop) => {
